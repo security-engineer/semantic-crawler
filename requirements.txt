@@ -2,3 +2,4 @@ semanticscholar
 pypdf
 requests
 beautifulsoup4
+pdfplumber

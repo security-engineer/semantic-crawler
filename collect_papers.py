@@ -18,6 +18,138 @@ import datetime
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+
+
+def extract_introduction_font_aware(pdf_content):
+    """
+    Extract Introduction using pdfplumber and font size analysis.
+    Returns extracted text or None if failed.
+    """
+    try:
+        import pdfplumber
+        from collections import Counter
+        import statistics
+
+        with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+            if not pdf.pages:
+                return None
+                
+            # 1. Determine Body Text Font Size
+            # Sample first 3 pages
+            all_chars = []
+            for page in pdf.pages[:3]:
+                all_chars.extend(page.chars)
+            
+            if not all_chars:
+                return None # Scanned PDF?
+                
+            # Filter distinct sizes
+            sizes = [round(c['size'], 1) for c in all_chars if c['text'].strip()]
+            if not sizes:
+                return None
+                
+            most_common_size, _ = Counter(sizes).most_common(1)[0]
+            header_threshold = most_common_size + 1.0 # Heuristic: Header is at least 1pt larger
+            
+            log(f"Font Analysis: Body Size ~{most_common_size}pt. Header Threshold >{header_threshold}pt")
+            
+            # 2. Iterate lines...
+            extracted_text = []
+            capturing = False
+            
+            # Intro aliases
+            intro_patterns = [r'Introduction', r'Executive\s*Summary', r'Background', r'Preliminaries']
+            
+            for page in pdf.pages[:5]: # Search first only 5 pages
+                # Extract words with layout info
+                # Reduce x_tolerance to avoid merging Drop Caps with body text (default is 3)
+                words = page.extract_words(keep_blank_chars=True, x_tolerance=1, extra_attrs=['size', 'fontname'])
+                
+                # Group into lines by 'top' (y-position)
+                lines = []
+                current_top = -1
+                line_buffer = []
+                
+                # Sort first by top, then x0
+                words.sort(key=lambda x: (round(x['top']), x['x0']))
+                
+                for w in words:
+                    if current_top == -1:
+                        current_top = w['top']
+                    
+                    # New line detection (vertical dist)
+                    if abs(w['top'] - current_top) > 5:
+                        if line_buffer:
+                            lines.append(line_buffer)
+                        line_buffer = []
+                        current_top = w['top']
+                    
+                    # Horizontal Gap detection (split line into segments)
+                    # For multi-column papers, large horizontal gaps mean column breaks.
+                    elif line_buffer:
+                        prev_w = line_buffer[-1]
+                        gap = w['x0'] - prev_w['x1']
+                        if gap > 15: # Threshold for column gap (approx 5mm or huge space)
+                             lines.append(line_buffer)
+                             line_buffer = []
+                             # Keep current_top as we are still on the same "visual line"
+                    
+                    line_buffer.append(w)
+                if line_buffer: lines.append(line_buffer)
+                
+                # Process lines
+                for line in lines:
+                    if not line: continue
+                    text = " ".join([w['text'] for w in line]).strip()
+                    # Use Median size instead of Average to ignore Drop Caps (Outliers)
+                    sizes_in_line = [w['size'] for w in line]
+                    avg_size = statistics.median(sizes_in_line) # Named avg_size for compatibility but it's median
+                    is_header = avg_size >= header_threshold
+                    
+                    # A. Start Condition
+                    if not capturing:
+                        if is_header:
+                            # Check if matches Introduction
+                            is_intro = any(re.search(pat, text, re.IGNORECASE) for pat in intro_patterns)
+                            # Extra check: "1. Introduction" or just "Introduction"
+                            # Avoid false positives like "Section 1: Introduction to..." in TOC?
+                            # Usually TOC has dots ..... 
+                            if is_intro and "....." not in text:
+                                log(f"Found Start Header: '{text}' (Size: {avg_size:.1f})")
+                                capturing = True
+                                continue
+                    
+                    # B. Stop Condition
+                    if capturing:
+                        # If we hit another header -> Stop
+                        if is_header:
+                            # Is it a real section header?
+                            # Ignore short headers (Drop Caps, single numbers "1", Roman "I" without text)
+                            # "2. Background" is > 3. "Introduction" is > 3.
+                            if len(text) < 3:
+                                continue 
+                            
+                            # Ignore LONG headers (likely Body text with Drop Cap or bolding)
+                            # Section headers are rarely > 150 chars.
+                            if len(text) > 150:
+                                continue
+                            
+                            log(f"Found Stop Header: '{text}' (Size: {avg_size:.1f})")
+                            return "\n".join(extracted_text).strip()
+                        
+                        # Accumulate
+                        extracted_text.append(text)
+            
+            if capturing: # End of pages reached
+                return "\n".join(extracted_text).strip()
+                
+    except ImportError:
+        log("pdfplumber not installed. Skipping font-aware extraction.")
+    except Exception as e:
+        log(f"Font-aware extraction failed: {e}")
+        
+    return None
+
 def extract_introduction(pdf_url, abstract_text=None):
     """
     Download PDF and extract the "Introduction" section.
@@ -39,7 +171,6 @@ def extract_introduction(pdf_url, abstract_text=None):
                 log(f"Failed to download PDF. Status Code: {response.status_code}")
                 return None
                 
-            log(f"Response received. Status: {response.status_code}")
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
             log(f"Network request failed: {e}")
@@ -60,10 +191,8 @@ def extract_introduction(pdf_url, abstract_text=None):
                 if meta_pdf and meta_pdf.get('content'):
                     real_pdf_url = meta_pdf['content']
                     log(f"Found real PDF URL in meta tag: {real_pdf_url}")
-                    # Recursively call with the real PDF URL or just download
                     log(f"Downloading real PDF from: {real_pdf_url}")
                     response = requests.get(real_pdf_url, headers=headers, timeout=15)
-                    log(f"Real PDF Response received. Status: {response.status_code}")
                     response.raise_for_status()
                     content = response.content
                     content_type = response.headers.get('Content-Type', '').lower()
@@ -82,6 +211,18 @@ def extract_introduction(pdf_url, abstract_text=None):
             log(f"[WARNING] Final content-type is '{content_type}', not PDF. Skipping extraction.")
             return None
 
+        # ---------------------------------------------------------
+        # NEW: Try Font-Aware Extraction First (Robust)
+        # ---------------------------------------------------------
+        log("Attempting Font-Aware Extraction (pdfplumber)...")
+        font_intro = extract_introduction_font_aware(content)
+        if font_intro and len(font_intro) > 50: # Sanity check
+            log("Font-Aware Extraction Successful!")
+            return font_intro
+        
+        log("Font-Aware Extraction failed or empty. Falling back to Regex...")
+        # ---------------------------------------------------------
+        
         with io.BytesIO(content) as f:
             reader = PdfReader(f)
             text = ""
@@ -89,6 +230,8 @@ def extract_introduction(pdf_url, abstract_text=None):
             max_pages = min(len(reader.pages), 5)
             for i in range(max_pages):
                 text += reader.pages[i].extract_text()
+        
+        # ... [Rest of the Regex Logic remains as fallback] ...
         
         # Define Stop Patterns for next sections
         # REFINED: Removed generic "2." to avoid matching list items (e.g. "2. Occurrences").
@@ -122,8 +265,8 @@ def extract_introduction(pdf_url, abstract_text=None):
 
         # Strategy 1: Standard Regex (Looking for "Introduction" header)
         # We changed stop_patterns to include the newline (in specific_titles_patt), so we adjust the lookahead key
-        # REFINED: Added support for "I." (Roman numeral) prefix
-        match = re.search(r'(?i)\n\s*(?:(?:1\.|I\.)\s*)?Introduction.*?\n(.*?)(?:\n\s*' + stop_patterns + r')', text, re.DOTALL)
+        # REFINED: Added support for "I." (Roman numeral) prefix and "Executive Summary"
+        match = re.search(r'(?i)\n\s*(?:(?:1\.|I\.)\s*)?(?:Introduction|Executive Summary).*?\n(.*?)(?:\n\s*' + stop_patterns + r')', text, re.DOTALL)
         if match:
              return match.group(1).strip()
 
@@ -193,8 +336,8 @@ def extract_introduction(pdf_url, abstract_text=None):
 
                     # Search for standard OR spaced-out Introduction header
                     # "1. Introduction" or "1 I NTRODUCTION" or just "Introduction" or "I. Introduction"
-                    # Flexible regex: I followed by space-opt N space-opt T...
-                    intro_header_pattern = r'(?:(?:1\.|I\.)\s*)?(?:I\s*N\s*T\s*R\s*O\s*D\s*U\s*C\s*T\s*I\s*O\s*N|Introduction)'
+                    # Also support "Executive Summary" as it often replaces Introduction in reports.
+                    intro_header_pattern = r'(?:(?:1\.|I\.)\s*)?(?:I\s*N\s*T\s*R\s*O\s*D\s*U\s*C\s*T\s*I\s*O\s*N|Introduction|Executive Summary)'
                     
                     # Update regex to use new stop_patterns format
                     intro_match = re.search(r'(?i)\n\s*' + intro_header_pattern + r'.*?\n(.*?)(?:\n\s*' + stop_patterns + r')', post_abstract_text, re.DOTALL)
@@ -221,7 +364,7 @@ def extract_introduction(pdf_url, abstract_text=None):
 
         # Fallback 3: Return text starting from "Introduction" (Truncation fallback)
         # Add support for Spaced Header here too
-        match_start = re.search(r'(?i)\n\s*(?:1\.?)?\s*(?:I\s*N\s*T\s*R\s*O\s*D\s*U\s*C\s*T\s*I\s*O\s*N|Introduction).*?\n', text)
+        match_start = re.search(r'(?i)\n\s*(?:1\.?)?\s*(?:I\s*N\s*T\s*R\s*O\s*D\s*U\s*C\s*T\s*I\s*O\s*N|Introduction|Executive Summary).*?\n', text)
         if match_start:
             return text[match_start.end():].strip()
             
