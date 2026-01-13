@@ -1,0 +1,4 @@
+semanticscholar
+pypdf
+requests
+beautifulsoup4
